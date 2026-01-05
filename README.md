@@ -18,6 +18,7 @@ This project is a Python implementation inspired by the original Java work done 
 ```bash
 pip install cryptography
 ```
+
 ## 📖 Usage
 
 1. Place your `.backup` file in the same directory as `decryptor.py`.
