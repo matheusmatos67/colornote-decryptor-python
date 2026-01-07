@@ -31,7 +31,7 @@ pip install pycryptodome
    python decryptor.py
    ```
 3. Enter your Master Password (default is usually `0000` if you never set one).
-4. Generates both files.
+4. Generates both JSON and JEX files.
 
   
 ### 📥 Importing into Joplin
