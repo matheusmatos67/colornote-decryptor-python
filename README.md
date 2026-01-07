@@ -31,11 +31,9 @@ pip install pycryptodome
    python decryptor.py
    ```
 3. Enter your Master Password (default is usually `0000` if you never set one).
-4. Select your export format:
-   - **1. JSON**: Raw data extraction (good for developers or archival).
-   - **2. JEX**: Importable file for Joplin.
-   - **3. Both**: Generates both files.
+4. Generates both files.
 
+  
 ### 📥 Importing into Joplin
 If you chose the JEX option:
 1. Open **Joplin**.
