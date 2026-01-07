@@ -45,9 +45,3 @@ If you chose the JEX option:
 ## ⚠️ Disclaimer
 This tool is provided "as is" for data recovery and migration purposes. Always keep a backup of your original files before running scripts against them.
 ```
-
-### Key Changes Made:
-1.  **Dependencies:** Changed `pip install cryptography` to `pip install pycryptodome` (as your new script uses `Crypto.Cipher` and `Crypto.Util`).
-2.  **Joplin Support:** Added a specific section explaining the `.jex` export and how to import it.
-3.  **File Support:** Updated the text to mention it now supports `.db` and `.dat` extensions, not just `.backup`.
-4.  **Checklists:** Added a note about how it converts specific ColorNote characters to Markdown checkboxes.
