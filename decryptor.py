@@ -2,160 +2,304 @@ import os
 import sys
 import json
 import hashlib
-import re
 import tarfile
 import tempfile
 import shutil
 import uuid
 import html
+import argparse
+import getpass
 from datetime import datetime, timezone
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
+from typing import List, Dict, Tuple, Optional
 
-def get_openssl_derived_bytes(password, salt):
-    """Mimics OpenSSL's EVP_BytesToKey for AES-128 and MD5."""
-    password_bytes = password.encode('utf-8')
-    # First hash provides the key (16 bytes)
-    m1 = hashlib.md5(password_bytes + salt).digest()
-    key = m1
-    # Second hash provides the IV (16 bytes)
-    m2 = hashlib.md5(m1 + password_bytes + salt).digest()
-    iv = m2
-    return key, iv
+# Dependency check
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import unpad
+except ImportError:
+    print("❌ Error: 'pycryptodome' library is missing.")
+    print("Run: pip install pycryptodome")
+    sys.exit(1)
 
-def generate_jex(notes_data, jex_path):
-    """Generates a Joplin Export (JEX) file from the note list."""
-    temp_dir = tempfile.mkdtemp()
-    try:
-        # Create Notebook Metadata
-        nb_id = uuid.uuid4().hex
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        nb_content = f"ColorNote Import\n\n\nid: {nb_id}\ncreated_time: {now}\nupdated_time: {now}\nuser_created_time: {now}\nuser_updated_time: {now}\ntype_: 2"
-        
-        with open(os.path.join(temp_dir, f"{nb_id}.md"), 'w', encoding='utf-8') as f:
-            f.write(nb_content)
+class ColorNoteDecryptor:
+    FIXED_SALT = "ColorNote Fixed Salt".encode('utf-8')
 
-        # Create Note Files
-        for note in notes_data:
-            title = html.unescape(note.get('title', ''))
-            body = html.unescape(note.get('note', ''))
-            if not title and not body: continue
+    def __init__(self, filepath: str, password: str = "0000"):
+        self.filepath = filepath
+        self.password = password
+        self.raw_data = b""
+        self.decrypted_text = ""
+        self.notes: List[Dict] = []
 
-            note_id = uuid.uuid4().hex
-            # Convert Unix ms timestamps to ISO strings
-            c_time = datetime.fromtimestamp(note.get('created_date', 0)/1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            m_time = datetime.fromtimestamp(note.get('modified_date', 0)/1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    def _derive_key_iv(self) -> Tuple[bytes, bytes]:
+        """Derives AES key and IV using OpenSSL-compatible MD5 hashing."""
+        password_bytes = self.password.encode('utf-8')
+        m1 = hashlib.md5(password_bytes + self.FIXED_SALT).digest()
+        key = m1
+        m2 = hashlib.md5(m1 + password_bytes + self.FIXED_SALT).digest()
+        iv = m2
+        return key, iv
 
-            if note.get('type') == 16: # Checklist type
-                # Convert ColorNote [V] and [ ] to Joplin/Markdown checkboxes
-                body = body.replace("[ ]", "- [ ]")
-                body = body.replace("[V]", "- [x]")
+    def decrypt(self) -> bool:
+        """Decrypts the AES-128-CBC stream."""
+        if not os.path.exists(self.filepath):
+            raise FileNotFoundError(f"File not found: {self.filepath}")
 
-            deleted_time = note.get('modified_date', 0) if note.get('active_state') == 16 else 0
-            
-            md_content = f"{title}\n\n{body}\n\n\nid: {note_id}\nparent_id: {nb_id}\ncreated_time: {c_time}\nupdated_time: {m_time}\nuser_created_time: {c_time}\nuser_updated_time: {m_time}\nmarkup_language: 1\ntype_: 1\ndeleted_time: {deleted_time}"
-            
-            with open(os.path.join(temp_dir, f"{note_id}.md"), 'w', encoding='utf-8') as f:
-                f.write(md_content)
+        with open(self.filepath, 'rb') as f:
+            self.raw_data = f.read()
 
-        # Archive to JEX (tar format)
-        with tarfile.open(jex_path, "w") as tar:
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    tar.add(os.path.join(root, file), arcname=file)
-    finally:
-        shutil.rmtree(temp_dir)
+        if len(self.raw_data) < 44:
+            raise ValueError("File is too small to be a valid ColorNote backup.")
 
-def main():
-    # 1. File Auto-Detection
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    extensions = ('.db', '.backup', '.dat')
-    backup_files = [f for f in os.listdir(current_dir) if f.endswith(extensions)]
-
-    if not backup_files:
-        print(f"❌ No backup files found in: {current_dir}")
-        input("Press Enter to exit...")
-        return
-
-    print("--- ColorNote Decryptor ---")
-    input_file = backup_files[0]
-    print(f"Target file: {input_file}")
-
-    # 2. User Input
-    password = input("\nEnter ColorNote password (default '0000'): ") or "0000"
-
-    print("\nSelect Export Option:")
-    print("1. JSON (Raw data)")
-    print("2. JEX (Joplin Import Format)")
-    print("3. Both")
-    choice = input("Choice (1-3): ")
-
-    # 3. Decryption Logic
-    try:
-        salt = "ColorNote Fixed Salt".encode('utf-8')
-        key, iv = get_openssl_derived_bytes(password, salt)
-        
-        with open(input_file, 'rb') as f:
-            file_bytes = f.read()
-        
-        # ColorNote backups usually have a 28-byte header
+        # ColorNote has a 28-byte header before the encrypted payload
         offset = 28
-        if len(file_bytes) <= offset:
-            print("❌ Error: File is too small to contain encrypted data.")
-            return
-
-        encrypted_payload = file_bytes[offset:]
-        cipher = AES.new(key, AES.MODE_CBC, iv)
+        encrypted_payload = self.raw_data[offset:]
         
-        # Decrypt and decode, ignoring characters that can't be UTF-8 (like garbage blocks)
-        decrypted_bytes = cipher.decrypt(encrypted_payload)
-        decrypted_text = decrypted_bytes.decode('utf-8', errors='ignore')
+        key, iv = self._derive_key_iv()
+        cipher = AES.new(key, AES.MODE_CBC, iv)
 
-        # Use regex to find potential JSON boundaries
-        placeholder = "---JSON-RECORD-SEPARATOR---"
-        cleaned_text = re.sub(r'\x00\x00..', placeholder, decrypted_text, flags=re.DOTALL)
-        records = cleaned_text.split(placeholder)
+        try:
+            decrypted_bytes = cipher.decrypt(encrypted_payload)
+            # PKCS7 unpadding verifies the password implicitly
+            unpadded_bytes = unpad(decrypted_bytes, AES.block_size)
+            # Decode with 'ignore' to strip binary wrappers/Java serialization headers
+            self.decrypted_text = unpadded_bytes.decode('utf-8', errors='ignore') 
+            return True
+        except (ValueError, KeyError):
+            return False
 
-        cleaned_objects = []
-        for record in records:
-            record = record.strip()
-            first_brace = record.find('{')
-            last_brace = record.rfind('}')
-            
-            if first_brace != -1 and last_brace > first_brace:
-                json_str = record[first_brace:last_brace + 1]
-                try:
-                    # Individual block validation
-                    parsed_json = json.loads(json_str)
-                    cleaned_objects.append(parsed_json)
-                except json.JSONDecodeError:
-                    # Skips corrupted/garbage blocks (common in the first 16 bytes)
+    def extract_json_smart(self):
+        """
+        Parses the decrypted stream using a bracket-balancing state machine.
+        This ignores garbage between records and handles nested JSON correctly.
+        """
+        self.notes = []
+        text = self.decrypted_text
+        length = len(text)
+        i = 0
+
+        print(f"   🔍 Scanning {length} bytes of decrypted data...")
+
+        while i < length:
+            # Find the start of a potential JSON object
+            start_index = text.find('{', i)
+            if start_index == -1:
+                break
+
+            # State machine to find the matching closing brace
+            balance = 0
+            in_quote = False
+            escape = False
+            end_index = -1
+
+            for j in range(start_index, length):
+                char = text[j]
+
+                # Handle escape sequences (e.g. \" inside a string)
+                if escape:
+                    escape = False
+                    continue
+                if char == '\\':
+                    escape = True
                     continue
 
-        if not cleaned_objects:
-            print("❌ Error: Could not extract any valid notes. Check your password.")
-            input("\nPress Enter to close...")
+                # Handle Quotes: Don't count brackets inside strings
+                if char == '"':
+                    in_quote = not in_quote
+                    continue
+
+                if not in_quote:
+                    if char == '{':
+                        balance += 1
+                    elif char == '}':
+                        balance -= 1
+                        # If balance hits zero, we found the closing brace
+                        if balance == 0:
+                            end_index = j
+                            break
+            
+            if end_index != -1:
+                # Extract candidate string
+                candidate = text[start_index : end_index + 1]
+                try:
+                    # Parse JSON to verify validity
+                    obj = json.loads(candidate)
+                    if isinstance(obj, dict):
+                        # Add metadata for easier manual debugging
+                        if 'modified_date' in obj:
+                            obj['_readable_date'] = self._fmt_time(obj['modified_date'])
+                        self.notes.append(obj)
+                    
+                    # Success! Move index past this object
+                    i = end_index + 1
+                    continue 
+                except json.JSONDecodeError:
+                    # False positive: bracket balanced, but invalid JSON content.
+                    # Advance just past the opening brace and try again
+                    i = start_index + 1
+            else:
+                # Unbalanced brackets (broken file or end of stream)
+                i = start_index + 1
+
+    def export_jex(self, output_path: str):
+        """Creates a Joplin Export (JEX) archive."""
+        if not self.notes:
+            print("⚠️ No notes to export.")
             return
 
-        # 4. Save Outputs
-        base_name = os.path.splitext(input_file)[0]
-        
-        if choice in ['1', '3']:
-            out_json = f"{base_name}_decrypted.json"
-            with open(out_json, 'w', encoding='utf-8') as f:
-                json.dump(cleaned_objects, f, indent=4, ensure_ascii=False)
-            print(f"✅ JSON exported to: {out_json}")
+        temp_dir = tempfile.mkdtemp()
+        try:
+            nb_id = uuid.uuid4().hex
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            
+            # 1. Create Notebook Metadata (The folder in Joplin)
+            nb_content = (
+                f"ColorNote Import\n\n\nid: {nb_id}\n"
+                f"created_time: {now}\nupdated_time: {now}\n"
+                f"user_created_time: {now}\nuser_updated_time: {now}\ntype_: 2"
+            )
+            with open(os.path.join(temp_dir, f"{nb_id}.md"), 'w', encoding='utf-8') as f:
+                f.write(nb_content)
 
-        if choice in ['2', '3']:
-            out_jex = f"{base_name}_export.jex"
-            generate_jex(cleaned_objects, out_jex)
-            print(f"✅ JEX exported to: {out_jex}")
+            # 2. Create Note Files
+            count = 0
+            for note in self.notes:
+                # Filter: Only export Notes (0) and Checklists (16)
+                # Skip Folders (128) and Settings (256)
+                if note.get('type') in [0, 16]:
+                    self._create_joplin_note(note, temp_dir, nb_id)
+                    count += 1
+            
+            print(f"   ℹ️  Packaged {count} notes into JEX (filtered {len(self.notes)-count} non-note items).")
+
+            # 3. Tar it up
+            with tarfile.open(output_path, "w") as tar:
+                for root, _, files in os.walk(temp_dir):
+                    for file in files:
+                        tar.add(os.path.join(root, file), arcname=file)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def _create_joplin_note(self, note: Dict, temp_dir: str, nb_id: str):
+        title = html.unescape(note.get('title', '') or "Untitled")
+        body = html.unescape(note.get('note', '') or "")
+        
+        c_time = self._fmt_time(note.get('created_date'))
+        m_time = self._fmt_time(note.get('modified_date'))
+
+        # Convert ColorNote Checklists to Markdown
+        if note.get('type') == 16:
+            body = body.replace("[ ]", "- [ ] ").replace("[V]", "- [x] ")
+
+        # Handle Deleted/Archived state
+        is_deleted = note.get('active_state') == 16
+        deleted_time = note.get('modified_date', 0) if is_deleted else 0
+
+        note_id = uuid.uuid4().hex
+        md_content = (
+            f"{title}\n\n{body}\n\n\n"
+            f"id: {note_id}\nparent_id: {nb_id}\n"
+            f"created_time: {c_time}\nupdated_time: {m_time}\n"
+            f"user_created_time: {c_time}\nuser_updated_time: {m_time}\n"
+            f"markup_language: 1\ntype_: 1\ndeleted_time: {deleted_time}"
+        )
+
+        # Sanitize filename
+        safe_filename = "".join([c for c in note_id if c.isalnum() or c in ('-','_')])
+        with open(os.path.join(temp_dir, f"{safe_filename}.md"), 'w', encoding='utf-8') as f:
+            f.write(md_content)
+
+    @staticmethod
+    def _fmt_time(ms_timestamp: Optional[int]) -> str:
+        """Converts Unix MS timestamp to Joplin ISO format."""
+        if not ms_timestamp:
+            return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        return datetime.fromtimestamp(ms_timestamp/1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+def select_file() -> str:
+    """Auto-detects backup files in the current folder."""
+    current_dir = os.getcwd()
+    exts = ('.db', '.backup', '.dat')
+    files = [f for f in os.listdir(current_dir) if f.lower().endswith(exts)]
+
+    if not files:
+        print(f"❌ No backup files {exts} found in: {current_dir}")
+        sys.exit(0)
+
+    if len(files) == 1:
+        print(f"📄 Found file: {files[0]}")
+        return files[0]
+
+    print("\nFound multiple backup files:")
+    for idx, f in enumerate(files):
+        print(f"{idx + 1}. {f}")
+    
+    while True:
+        try:
+            choice = int(input(f"Select file (1-{len(files)}): "))
+            if 1 <= choice <= len(files):
+                return files[choice - 1]
+        except ValueError:
+            pass
+        print("Invalid selection.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Decrypt ColorNote backups (Final Version).")
+    parser.add_argument("file", nargs="?", help="Path to the .backup/.db file")
+    parser.add_argument("-p", "--password", help="Backup password")
+    parser.add_argument("-f", "--format", choices=['json', 'jex', 'both'], default='both', help="Output format")
+    args = parser.parse_args()
+
+    # 1. Select File
+    target_file = args.file if args.file else select_file()
+
+    # 2. Get Password
+    password = args.password
+    if not password:
+        use_default = input("Use default password '0000'? (Y/n): ").lower() != 'n'
+        password = "0000" if use_default else getpass.getpass("Enter Password: ")
+
+    print(f"\n🔐 Processing: {target_file}...")
+    
+    decryptor = ColorNoteDecryptor(target_file, password)
+    
+    try:
+        # 3. Decrypt
+        if not decryptor.decrypt():
+            print("\n❌ Decryption failed! Password incorrect.")
+            sys.exit(1)
+        
+        print("✅ Decryption successful.")
+        
+        # 4. Parse
+        decryptor.extract_json_smart()
+        
+        total_found = len(decryptor.notes)
+        print(f"📊 Total records found: {total_found}")
+
+        if total_found == 0:
+            print("⚠️ Warning: File decrypted but no records found. It might be empty.")
+            sys.exit(0)
 
     except Exception as e:
-        print(f"❌ Critical Error: {e}")
-    
-    print("\nProcess finished.")
-    input("Press Enter to close...")
+        print(f"\n❌ Critical Error: {e}")
+        sys.exit(1)
+
+    # 5. Export
+    base_name = os.path.splitext(target_file)[0]
+
+    if args.format in ['json', 'both']:
+        out_json = f"{base_name}_decrypted.json"
+        with open(out_json, 'w', encoding='utf-8') as f:
+            json.dump(decryptor.notes, f, indent=4, ensure_ascii=False)
+        print(f"💾 JSON Saved: {out_json} (Full Backup)")
+
+    if args.format in ['jex', 'both']:
+        out_jex = f"{base_name}_export.jex"
+        decryptor.export_jex(out_jex)
+        print(f"💾 JEX Saved:  {out_jex} (Ready for Joplin Import)")
+
+    print("\n✨ Done.")
 
 if __name__ == "__main__":
     main()
