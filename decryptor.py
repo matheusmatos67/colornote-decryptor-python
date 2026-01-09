@@ -59,8 +59,8 @@ class ColorNoteCrypto:
         try:
             decrypted_bytes = cipher.decrypt(payload)
             unpadded_bytes = unpad(decrypted_bytes, AES.block_size)
-            # Decode with ignore to handle any binary garbage at the edges
-            return unpadded_bytes.decode('utf-8', errors='ignore')
+            
+            return unpadded_bytes.decode('utf-8', errors='replace')
         except (ValueError, KeyError) as e:
             raise ValueError("Decryption failed. Incorrect password or corrupted file.") from e
 
